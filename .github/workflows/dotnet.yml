@@ -1,0 +1,125 @@
+name: .NET build and publish
+
+on:
+  workflow_call:
+    inputs:
+      DOCS_FOLDER:
+        required: true
+        type: string
+      CHECK_FORMATTING:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      NUGET_KEY:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0
+
+    - name: Compute version and write rsp file
+      run: |
+        shopt -s extglob
+
+        git fetch --tags --force  # https://github.com/actions/checkout/issues/290#issuecomment-680260080
+
+        # 'git describe' outputs in a format like
+        # 'tagName-commitCount-shortHash', and I want to turn that
+        # into a legal nuget version. My tags start with 'v', so
+        # let's lop that off, and change the _last_ '-' to '.'
+        # (so that everything after tagName becomes part of the
+        # prerelease annotation). When we're on an actual tag,
+        # 'git describe' simply outputs the tag name, so the second
+        # regex will not match (and sed will echo the input unchanged)
+        version=$(git describe | sed s/^v// | sed -r 's/(.*)-/\1./')
+
+        echo Version $version
+        echo -p:Configuration=Release -p:Version=$version -p:ContinuousIntegrationBuild=true | tee Directory.Build.rsp
+
+    - id: restore
+      name: Restore
+      run: dotnet restore && dotnet tool restore
+
+    - id: format
+      name: Check formatting
+      if: ${{ inputs.CHECK_FORMATTING }}
+      run: dotnet format --no-restore --verify-no-changes
+
+    - id: build
+      name: Build
+      run: dotnet build --no-restore
+
+    - id: test
+      name: Test
+      run: dotnet test --no-build --verbosity normal --collect:"XPlat Code Coverage" --logger trx
+
+    - uses: codecov/codecov-action@v4
+
+    - id: pack
+      name: Pack
+      run: dotnet pack --no-build
+
+    - name: Attest
+      if: github.ref_type == 'tag'
+      uses: actions/attest-build-provenance@v1
+      with:
+        subject-path: 'artifacts/package/release/*'
+
+    - name: Compute checksums
+      run: |
+        pushd artifacts/package/release
+        for file in *;
+          do sha256sum -b $file > $file.sha256;
+        done
+        popd
+
+    # - id: push
+    #   name: Push nuget packages
+    #   if: ${{ github.ref_type == 'tag' }}
+    #   run: |
+    #     dotnet nuget push 'artifacts/package/release/*' --source https://api.nuget.org/v3/index.json -k ${{ secrets.NUGET_KEY }}
+    #     dotnet nuget push 'artifacts/package/release/*' --source https://nuget.pkg.github.com/benjamin-hodgson/index.json -k ${{ github.token }}
+
+    # - name: Create Github Release
+    #   if: ${{ github.ref_type == 'tag' }}
+    #   # get most recent section of changelog for release notes
+    #   run: cat CHANGELOG.md | sed -r '1,/^-+$/d' | sed -r '/^-+$/q' | head -n -2 | gh release create $GITHUB_REF_NAME ./artifacts/package/release/* --verify-tag --notes-file -
+    #   env:
+    #     GITHUB_TOKEN: ${{ github.token }}
+
+    - name: Deploy docs
+      uses: JamesIves/github-pages-deploy-action@65b5dfd4f5bcd3a7403bbc2959c144256167464e  # v4.5.0
+      if: ${{ github.event_name != 'pull_request' }}
+      with:
+        branch: gh-pages
+        folder: artifacts/bin/${{ inputs.DOCS_FOLDER }}/release/_site
+        target-folder: ${{ github.ref_name }}
+
+    - uses: actions/upload-artifact@v4
+      if: steps.pack.conclusion != 'cancelled' && steps.pack.conclusion != 'skipped'
+      with:
+        name: packages
+        path: artifacts/package/release
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.DOCS_FOLDER }}
+        path: artifacts/bin/${{ inputs.DOCS_FOLDER }}/release/_site
+
+    - uses: actions/upload-artifact@v4
+      if: steps.test.conclusion != 'cancelled' && steps.test.conclusion != 'skipped'
+      with:
+        name: TestResults
+        path: |
+          **/TestResults/*.trx
+          **/TestResults/*/coverage.cobertura.xml
